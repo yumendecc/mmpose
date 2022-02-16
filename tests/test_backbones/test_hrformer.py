@@ -1,103 +1,178 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import pytest
 import torch
 
-from mmpose.models.backbones import HRFormer
-from mmpose.models.backbones.hrformer import (HRTransformerModule,
-                                              LocalWindowTransformerBlock)
-from mmpose.models.backbones.resnet import Bottleneck
+from mmpose.models.backbones.hrformer import HRFomerModule, HRFormer
 
 
-def all_zeros(modules):
-    """Check if the weight(and bias) is all zero."""
-    weight_zero = torch.equal(modules.weight.data,
-                              torch.zeros_like(modules.weight.data))
-    if hasattr(modules, 'bias'):
-        bias_zero = torch.equal(modules.bias.data,
-                                torch.zeros_like(modules.bias.data))
-    else:
-        bias_zero = True
+def test_hrformer_module(block):
+    norm_cfg = dict(type='BN')
 
-    return weight_zero and bias_zero
-
-
-def test_hrmodule():
-    # Test HighResolutionTransformerModule forward
-    module = HRTransformerModule(
+    # Test multiscale forward
+    num_channles = (32, 64)
+    num_inchannels = [c * block.expansion for c in num_channles]
+    hrmodule = HRFomerModule(
         num_branches=2,
-        blocks=LocalWindowTransformerBlock,
+        block=block,
         num_blocks=(2, 2),
-        in_channels=[32, 64],
-        num_channels=(32, 64),
-        num_heads=[1, 2],
-        num_mlp_ratios=[4, 4],
-        num_window_sizes=[7, 7],
-        multiscale_output=True,
-        with_cp=False,
-        norm_cfg=dict(type='BN', requires_grad=True),
-        conv_cfg=None,
-        drop_paths=[0, 0])
+        num_inchannels=num_inchannels,
+        num_channels=num_channles,
+        num_heads=(1, 2),
+        num_window_sizes=(7, 7),
+        num_mlp_ratios=(4, 4),
+        drop_path=(0., 0.),
+        norm_cfg=norm_cfg)
 
-    x = [torch.randn(2, 32, 56, 56), torch.randn(2, 64, 28, 28)]
-    x_out = module(x)
-    assert x_out[0].shape == torch.Size([2, 32, 56, 56])
-    assert x_out[1].shape == torch.Size([2, 64, 28, 28])
+    feats = [
+        torch.randn(1, num_inchannels[0], 64, 64),
+        torch.randn(1, num_inchannels[1], 32, 32)
+    ]
+    feats = hrmodule(feats)
+
+    assert len(str(hrmodule)) > 0
+    assert len(feats) == 2
+    assert feats[0].shape == torch.Size([1, num_inchannels[0], 64, 64])
+    assert feats[1].shape == torch.Size([1, num_inchannels[1], 32, 32])
+
+    # Test single scale forward
+    num_channles = (32, 64)
+    in_channels = [c * block.expansion for c in num_channles]
+    hrmodule = HRFomerModule(
+        num_branches=2,
+        block=block,
+        num_blocks=(2, 2),
+        num_inchannels=num_inchannels,
+        num_channels=num_channles,
+        num_heads=(1, 2),
+        num_window_sizes=(7, 7),
+        num_mlp_ratios=(4, 4),
+        drop_path=(0., 0.),
+        norm_cfg=norm_cfg,
+        multiscale_output=False,
+    )
+
+    feats = [
+        torch.randn(1, in_channels[0], 64, 64),
+        torch.randn(1, in_channels[1], 32, 32)
+    ]
+    feats = hrmodule(feats)
+
+    assert len(feats) == 1
+    assert feats[0].shape == torch.Size([1, in_channels[0], 64, 64])
+
+    # Value tests
+    kwargs = dict(
+        num_branches=2,
+        block=block,
+        num_blocks=(2, 2),
+        num_inchannels=num_inchannels,
+        num_channels=num_channles,
+        num_heads=(1, 2),
+        num_window_sizes=(7, 7),
+        num_mlp_ratios=(4, 4),
+        drop_path=(0.1, 0.1),
+        norm_cfg=norm_cfg,
+    )
+
+    with pytest.raises(ValueError):
+        # len(num_blocks) should equal num_branches
+        kwargs['num_blocks'] = [2, 2, 2]
+        HRFomerModule(**kwargs)
+    kwargs['num_blocks'] = [2, 2, 2]
+
+    with pytest.raises(ValueError):
+        # len(num_blocks) should equal num_branches
+        kwargs['num_channels'] = [2]
+        HRFomerModule(**kwargs)
+    kwargs['num_channels'] = [2, 2]
+
+    with pytest.raises(ValueError):
+        # len(num_blocks) should equal num_branches
+        kwargs['num_inchannels'] = [2]
+        HRFomerModule(**kwargs)
+    kwargs['num_inchannels'] = [2, 2]
+
+    # Test single branch HRFormer module
+    hrmodule = HRFomerModule(
+        num_branches=1,
+        block=block,
+        num_blocks=(1, ),
+        num_inchannels=[2],
+        num_channels=[2],
+        num_heads=(1, ),
+        num_window_sizes=(7, ),
+        num_mlp_ratios=(4, ),
+        drop_path=(0.1, ),
+        norm_cfg=norm_cfg,
+    )
 
 
 def test_hrformer_backbone():
+    norm_cfg = dict(type='BN')
+    # only have 3 stages
     extra = dict(
-        drop_path_rate=0.1,
         stage1=dict(
             num_modules=1,
             num_branches=1,
             block='BOTTLENECK',
             num_blocks=(2, ),
-            num_channels=(32, ),
-            num_heads=[2],
-            num_mlp_ratios=[4]),
+            num_channels=(64, )),
         stage2=dict(
             num_modules=1,
             num_branches=2,
-            block='TRANSFORMER_BLOCK',
+            block='HRFORMER',
+            window_sizes=(7, 7),
+            num_heads=(1, 2),
+            mlp_ratios=(4, 4),
             num_blocks=(2, 2),
-            num_channels=(32, 64),
-            num_heads=[1, 2],
-            num_mlp_ratios=[4, 4],
-            num_window_sizes=[7, 7]),
+            num_channels=(32, 64)),
         stage3=dict(
             num_modules=4,
             num_branches=3,
-            block='TRANSFORMER_BLOCK',
+            block='HRFORMER',
+            window_sizes=(7, 7, 7),
+            num_heads=(1, 2, 4),
+            mlp_ratios=(4, 4, 4),
             num_blocks=(2, 2, 2),
-            num_channels=(32, 64, 128),
-            num_heads=[1, 2, 4],
-            num_mlp_ratios=[4, 4, 4],
-            num_window_sizes=[7, 7, 7]),
-        stage4=dict(
-            num_modules=2,
-            num_branches=4,
-            block='TRANSFORMER_BLOCK',
-            num_blocks=(2, 2, 2, 2),
-            num_channels=(32, 64, 128, 256),
-            num_heads=[1, 2, 4, 8],
-            num_mlp_ratios=[4, 4, 4, 4],
-            num_window_sizes=[7, 7, 7, 7]))
+            num_channels=(32, 64, 128)))
 
-    model = HRFormer(extra=extra, in_channels=3)
+    with pytest.raises(AssertionError):
+        # HRNet now only support 4 stages
+        HRFormer(extra=extra)
 
-    imgs = torch.randn(2, 3, 224, 224)
-    feat = model(imgs)
-    assert len(feat) == 1
-    assert feat[0].shape == torch.Size([2, 32, 56, 56])
+    extra['stage4'] = dict(
+        num_modules=3,
+        num_branches=3,  # should be 4
+        block='HRFORMER',
+        window_sizes=(7, 7, 7, 7),
+        num_heads=(1, 2, 4, 8),
+        mlp_ratios=(4, 4, 4, 4),
+        num_blocks=(2, 2, 2, 2),
+        num_channels=(32, 64, 128, 256))
 
-    # Test HRNet zero initialization of residual
-    model = HRFormer(extra, in_channels=3, zero_init_residual=True)
+    with pytest.raises(AssertionError):
+        # len(num_blocks) should equal num_branches
+        HRFormer(extra=extra)
+
+    extra['stage4']['num_branches'] = 4
+
+    # Test HRFormer-S
+    model = HRFormer(extra=extra, norm_cfg=norm_cfg)
     model.init_weights()
-    for m in model.modules():
-        if isinstance(m, Bottleneck):
-            assert all_zeros(m.norm3)
     model.train()
 
-    imgs = torch.randn(2, 3, 224, 224)
-    feat = model(imgs)
-    assert len(feat) == 1
-    assert feat[0].shape == torch.Size([2, 32, 56, 56])
+    imgs = torch.randn(1, 3, 64, 64)
+    feats = model(imgs)
+    assert len(feats) == 4
+    assert feats[0].shape == torch.Size([1, 32, 16, 16])
+    assert feats[3].shape == torch.Size([1, 256, 2, 2])
+
+    # Test single scale output
+    model = HRFormer(extra=extra, multiscale_output=False, norm_cfg=norm_cfg)
+    model.init_weights()
+    model.train()
+
+    imgs = torch.randn(1, 3, 64, 64)
+    feats = model(imgs)
+    assert len(feats) == 1
+    assert feats[0].shape == torch.Size([1, 32, 16, 16])

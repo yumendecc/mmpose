@@ -65,6 +65,8 @@ class WindowMSA(BaseModule):
         attn_drop_rate (float, optional): Dropout ratio of attention weight.
             Default: 0.0
         proj_drop_rate (float, optional): Dropout ratio of output. Default: 0.
+        with_rpe (bool, optional): If True, use relative position bias.
+            Default: True.
         init_cfg (dict | None, optional): The Config for initialization.
             Default: None.
     """
@@ -95,7 +97,6 @@ class WindowMSA(BaseModule):
                     (2 * window_size[0] - 1) * (2 * window_size[1] - 1),
                     num_heads))  # 2*Wh-1 * 2*Ww-1, nH
 
-            # About 2x faster than original impl
             Wh, Ww = self.window_size
             rel_index_coords = self.double_step_seq(2 * Ww - 1, Wh, 1, Ww)
             rel_position_index = rel_index_coords + rel_index_coords.T
@@ -123,7 +124,6 @@ class WindowMSA(BaseModule):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
                                   C // self.num_heads).permute(2, 0, 3, 1, 4)
-        # make torchscript happy (cannot use tensor as tuple)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         q = q * self.scale
@@ -167,8 +167,21 @@ class LocalWindowSelfAttention(BaseModule):
     Interlaced Sparse Self-Attention <https://arxiv.org/abs/1907.12273>`_.
 
     Args:
-        window_size (tuple[int]): Window size.
-        init_cfg (dict or list[dict], optional): Initialization config dict.
+        embed_dims (int): Number of input channels.
+        num_heads (int): Number of attention heads.
+        window_size (tuple[int] | int): The height and width of the window.
+        qkv_bias (bool, optional):  If True, add a learnable bias to q, k, v.
+            Default: True.
+        qk_scale (float | None, optional): Override default qk scale of
+            head_dim ** -0.5 if set. Default: None.
+        attn_drop_rate (float, optional): Dropout ratio of attention weight.
+            Default: 0.0
+        proj_drop_rate (float, optional): Dropout ratio of output. Default: 0.
+        with_rpe (bool, optional): If True, use relative position bias.
+            Default: True.
+        with_pad_mask (bool, optional): If True, mask out the padded tokens in
+            the attention process. Default: False.
+        init_cfg (dict | None, optional): The Config for initialization.
             Default: None.
     """
 
@@ -183,14 +196,15 @@ class LocalWindowSelfAttention(BaseModule):
                  with_rpe=True,
                  with_pad_mask=False,
                  init_cfg=None):
-        super(LocalWindowSelfAttention, self).__init__(init_cfg=init_cfg)
-
+        super().__init__(init_cfg=init_cfg)
+        if isinstance(window_size, int):
+            window_size = (window_size, window_size)
         self.window_size = window_size
         self.with_pad_mask = with_pad_mask
         self.attn = WindowMSA(
             embed_dims=embed_dims,
             num_heads=num_heads,
-            window_size=(window_size, window_size),
+            window_size=window_size,
             qkv_bias=qkv_bias,
             qk_scale=qk_scale,
             attn_drop_rate=attn_drop_rate,
@@ -202,7 +216,7 @@ class LocalWindowSelfAttention(BaseModule):
         """Forward function."""
         B, N, C = x.shape
         x = x.view(B, H, W, C)
-        Wh = Ww = self.window_size
+        Wh, Ww = self.window_size
 
         # center-pad the feature on H and W axes
         pad_h = math.ceil(H / Wh) * Wh - H
@@ -213,18 +227,11 @@ class LocalWindowSelfAttention(BaseModule):
         # permute
         x = x.view(B, math.ceil(H / Wh), Wh, math.ceil(W / Ww), Ww, C)
         x = x.permute(0, 1, 3, 2, 4, 5)
-        x = x.reshape(-1, Wh * Ww,
-                      C)  # (B*num_window, Wh*Ww, C) ensure batch first
-
-        # x = x.permute(1, 3, 0, 2, 4, 5)
-        # x = x.reshape(-1, Wh * Ww, C)
-
-        # x = x.permute(2, 4, 0, 1, 3, 5)
-        # x = x.reshape(Wh * Ww, -1, C)
+        x = x.reshape(-1, Wh * Ww, C)  # (B*num_window, Wh*Ww, C)
 
         # attention
         if self.with_pad_mask and pad_h > 0 and pad_w > 0:
-            pad_mask = x.new_ones(1, H, W, 1)
+            pad_mask = x.new_zeros(1, H, W, 1)
             pad_mask = pad(
                 pad_mask, [
                     0, 0, pad_w // 2, pad_w - pad_w // 2, pad_h // 2,
@@ -241,8 +248,6 @@ class LocalWindowSelfAttention(BaseModule):
             out = self.attn(x, **kwargs)
 
         # reverse permutation
-        # out = out.reshape(math.ceil(H / Wh), math.ceil(W / Ww), B, Wh, Ww, C)
-        # out = out.permute(2, 0, 3, 1, 4, 5)
         out = out.reshape(B, math.ceil(H / Wh), math.ceil(W / Ww), Wh, Ww, C)
         out = out.permute(0, 1, 3, 2, 4, 5)
         out = out.reshape(B, H + pad_h, W + pad_w, C)
@@ -413,9 +418,13 @@ class HRFomerModule(HRModule):
         conv_cfg (dict, optional): Config of the conv layers.
             Default: None.
         norm_cfg (dict, optional): Config of the norm layers appended
-            right after conv. Default: None.
+            right after conv. Default: dict(type='SyncBN', requires_grad=True)
         transformer_norm_cfg (dict, optional): Config of the norm layers.
-            Default: None.
+            Default: dict(type='LN', eps=1e-6)
+        with_cp (bool): Use checkpoint or not. Using checkpoint will save some
+            memory while slowing down the training speed. Default: False
+        upsample_cfg(dict, optional): The config of upsample layers in fuse
+            layers. Default: dict(mode='bilinear', align_corners=False)
     """
 
     def __init__(self,
@@ -596,17 +605,10 @@ class HRFormer(HRNet):
         norm_eval (bool): Whether to set norm layers to eval mode, namely,
             freeze running stats (mean and var). Note: Effect on Batch Norm
             and its variants only. Default: False.
-        frozen_stages (int): Stages to be frozen (stop grad and set eval mode).
-            -1 means not freezing any parameters. Default: -1.
         zero_init_residual (bool): Whether to use zero init for last norm layer
             in resblocks to let them behave as identity. Default: False.
-        multiscale_output (bool): Whether to output multi-level features
-            produced by multiple branches. If False, only the first level
-            feature will be output. Default: True.
-        pretrained (str, optional): Model pretrained path. Default: None.
-        init_cfg (dict or list[dict], optional): Initialization config dict.
-            Default: None.
-
+        frozen_stages (int): Stages to be frozen (stop grad and set eval mode).
+            -1 means not freezing any parameters. Default: -1.
     Example:
         >>> from mmpose.models import HRFormer
         >>> import torch
@@ -713,7 +715,7 @@ class HRFormer(HRNet):
 
         modules = []
         for i in range(num_modules):
-            # multiscale_output is only used last module
+            # multiscale_output is only used at the last module
             if not multiscale_output and i == num_modules - 1:
                 reset_multiscale_output = False
             else:
