@@ -1,10 +1,11 @@
+_base_ = ['configs/_base_/datasets/coco.py']
 log_level = 'INFO'
 load_from = None
 resume_from = None
 dist_params = dict(backend='nccl')
 workflow = [('train', 1)]
-checkpoint_config = dict(interval=10, create_symlink=False)
-evaluation = dict(interval=10, metric='mAP', key_indicator='AP')
+checkpoint_config = dict(interval=5, create_symlink=False)
+evaluation = dict(interval=10, metric='mAP', save_best='AP')
 
 optimizer = dict(
     type='AdamW',
@@ -42,13 +43,12 @@ channel_cfg = dict(
 norm_cfg = dict(type='SyncBN', requires_grad=True)
 model = dict(
     type='TopDown',
-    pretrained='models/hrformer_base.pth',
     backbone=dict(
         type='HRFormer',
         in_channels=3,
         norm_cfg=norm_cfg,
         extra=dict(
-            drop_path_rate=0.3,
+            drop_path_rate=0.1,
             stage1=dict(
                 num_modules=1,
                 num_branches=1,
@@ -56,14 +56,14 @@ model = dict(
                 num_blocks=(2, ),
                 num_channels=(64, ),
                 num_heads=[2],
-                mlp_ratios=[4]),
+                num_mlp_ratios=[4]),
             stage2=dict(
                 num_modules=1,
                 num_branches=2,
                 block='HRFORMERBLOCK',
                 num_blocks=(2, 2),
-                num_channels=(78, 156),
-                num_heads=[2, 4],
+                num_channels=(32, 64),
+                num_heads=[1, 2],
                 mlp_ratios=[4, 4],
                 window_sizes=[7, 7]),
             stage3=dict(
@@ -71,8 +71,8 @@ model = dict(
                 num_branches=3,
                 block='HRFORMERBLOCK',
                 num_blocks=(2, 2, 2),
-                num_channels=(78, 156, 312),
-                num_heads=[2, 4, 8],
+                num_channels=(32, 64, 128),
+                num_heads=[1, 2, 4],
                 mlp_ratios=[4, 4, 4],
                 window_sizes=[7, 7, 7]),
             stage4=dict(
@@ -80,13 +80,15 @@ model = dict(
                 num_branches=4,
                 block='HRFORMERBLOCK',
                 num_blocks=(2, 2, 2, 2),
-                num_channels=(78, 156, 312, 624),
-                num_heads=[2, 4, 8, 16],
+                num_channels=(32, 64, 128, 256),
+                num_heads=[1, 2, 4, 8],
                 mlp_ratios=[4, 4, 4, 4],
-                window_sizes=[7, 7, 7, 7]))),
+                window_sizes=[7, 7, 7, 7],
+                multiscale_output=True,
+            ))),
     keypoint_head=dict(
         type='TopdownHeatmapSimpleHead',
-        in_channels=78,
+        in_channels=32,
         out_channels=channel_cfg['num_output_channels'],
         num_deconv_layers=0,
         extra=dict(final_conv_kernel=1, ),
@@ -96,12 +98,12 @@ model = dict(
         flip_test=True,
         post_process='default',
         shift_heatmap=True,
-        modulate_kernel=17))
+        modulate_kernel=11))
 
 data_root = 'data/coco'
 data_cfg = dict(
-    image_size=[288, 384],
-    heatmap_size=[72, 96],
+    image_size=[192, 256],
+    heatmap_size=[48, 64],
     num_output_channels=channel_cfg['num_output_channels'],
     num_joints=channel_cfg['dataset_joints'],
     dataset_channel=channel_cfg['dataset_channel'],
@@ -131,7 +133,7 @@ train_pipeline = [
         type='NormalizeTensor',
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225]),
-    dict(type='TopDownGenerateTarget', sigma=3),
+    dict(type='TopDownGenerateTarget', sigma=2),
     dict(
         type='Collect',
         keys=['img', 'target', 'target_weight'],
@@ -149,7 +151,6 @@ val_pipeline = [
         type='NormalizeTensor',
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225]),
-    dict(type='TopDownGenerateTarget', sigma=3),
     dict(
         type='Collect',
         keys=['img'],
@@ -162,10 +163,10 @@ val_pipeline = [
 test_pipeline = val_pipeline
 
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=32,
     workers_per_gpu=2,
-    val_dataloader=dict(samples_per_gpu=256),
-    test_dataloader=dict(samples_per_gpu=256),
+    val_dataloader=dict(samples_per_gpu=64),
+    test_dataloader=dict(samples_per_gpu=64),
     train=dict(
         type='TopDownCocoDataset',
         ann_file=f'{data_root}/annotations/person_keypoints_train2017.json',
